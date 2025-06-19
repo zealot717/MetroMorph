@@ -3,7 +3,7 @@
 import geopandas as gpd
 import networkx as nx
 import os
-from shapely.geometry import LineString
+from shapely.geometry import LineString, MultiLineString
 from tqdm import tqdm
 
 def main():
@@ -11,36 +11,51 @@ def main():
 
     # Load enriched GeoDataFrame
     gdf = gpd.read_file("data/enriched/enriched_graph_scored.gpkg")
+    print(f"📦 Loaded {len(gdf)} edges")
 
-    # Drop rows with invalid or null geometries
-    gdf = gdf[gdf.geometry.notnull()].copy()
-    gdf = gdf[gdf.geometry.type == "LineString"]
+    # Filter valid geometries: LineString or MultiLineString
+    gdf = gdf[gdf.geometry.notnull()]
+    gdf = gdf[gdf.geometry.type.isin(["LineString", "MultiLineString"])]
+    print(f"✅ After filtering: {len(gdf)} valid LineStrings or MultiLineStrings")
 
-    # Normalize weight direction (higher coolness = lower weight)
     G = nx.Graph()
-
     valid_count = 0
-    for idx, row in tqdm(gdf.iterrows(), total=len(gdf)):
+    skipped_short = 0
+    skipped_other = 0
+
+    for _, row in tqdm(gdf.iterrows(), total=len(gdf)):
         geom = row.geometry
-        if not isinstance(geom, LineString) or len(geom.coords) < 2:
+        cool_score = row.get("cool_score", None)
+
+        if cool_score is None or not geom:
+            skipped_other += 1
             continue
 
-        coords = list(geom.coords)
-        start = (coords[0][1], coords[0][0])  # lat, lon
-        end = (coords[-1][1], coords[-1][0])
+        # Convert MultiLineString to individual LineStrings
+        lines = [geom] if isinstance(geom, LineString) else list(geom.geoms)
 
-        # Invert cool score for weight: cooler = lower cost
-        weight = 1 - row["cool_score"]
-        try:
-            G.add_edge(start, end, weight=weight, geometry=geom.wkt)
-            valid_count += 1
-        except Exception as e:
-            continue
+        for line in lines:
+            coords = list(line.coords)
+            if len(coords) < 2:
+                skipped_short += 1
+                continue
+
+            start = (coords[0][1], coords[0][0])  # (lat, lon)
+            end = (coords[-1][1], coords[-1][0])
+            weight = 1 - cool_score
+
+            try:
+                G.add_edge(start, end, weight=weight, geometry=line.wkt)
+                valid_count += 1
+            except Exception:
+                skipped_other += 1
+                continue
 
     print(f"✅ Graph built with {G.number_of_nodes()} nodes and {G.number_of_edges()} edges.")
-    print(f"✅ Valid LineStrings used: {valid_count} / {len(gdf)}")
+    print(f"📊 Valid edges used: {valid_count}")
+    print(f"⚠️ Skipped (short lines): {skipped_short}, (other issues): {skipped_other}")
 
-    # Save to GraphML (geometry stored as WKT string)
+    # Save graph
     output_path = "data/routing/cool_graph.graphml"
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
     nx.write_graphml(G, output_path)
